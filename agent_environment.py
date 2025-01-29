@@ -5,20 +5,16 @@ import uuid
 import numpy as np
 import math
 import random
-import torch 
+import torch
 from genetics import GeneticCore
 from neural_networks import NeuralAdaptiveNetwork
 from executor import AdaptiveExecutor
 from diagnostics import NeuralDiagnostics
 from augmentation import AdaptiveDataAugmenter
 from embryo_namer import EmbryoNamer
+import perlin
 from adaptive_environment import AdaptiveEnvironment, EnvironmentalState, Resource, ResourceType
-from perlin_noise import PerlinNoise
-
-class ResourceType(Enum):
-    ENERGY = "energy"
-    INFORMATION = "information"
-    MATERIALS = "materials"
+from functools import partial
 
 @dataclass
 class Resource:
@@ -36,20 +32,50 @@ class EnvironmentalState:
     complexity_level: float
     agents: List['AdaptiveAgent'] = field(default_factory=list)
 
-class AgentAction(Enum):
-    MOVE = "move"
-    GATHER = "gather"
-    PROCESS = "process"
-    SHARE = "share"
-    DEFEND = "defend"
-    EXECUTE_TOOL = "execute_tool"
-
 @dataclass
 class ActionResult:
     success: bool
     reward: float
     energy_cost: float
     new_state: Optional[Dict]
+
+class ActionVector:
+    def __init__(self, selection: torch.Tensor, parameters: torch.Tensor):
+      self.selection = selection
+      self.parameters = parameters
+
+class ActionDecoder:
+    def __init__(self, hidden_size=128):
+        self.selection_size = 32  # Base action type encoding
+        self.parameter_size = 96  # Action parameters encoding
+
+        # Total hidden_size = selection_size + parameter_size
+        self.hidden_size = hidden_size
+        # Dictionary mapping action names to their prototype vectors
+        self.action_prototypes = {}  
+        # The actual functions for each action
+        self.action_methods = {}
+
+    def add_action(self, name: str, prototype_vector: torch.Tensor, method):
+        self.action_prototypes[name] = prototype_vector
+        self.action_methods[name] = method
+    def decode_selection(self, selection_vector: torch.Tensor) -> tuple[str, float]:
+        # Find closest prototype using cosine similarity
+        best_similarity = -1
+        selected_action = None
+
+        for name, prototype in self.action_prototypes.items():
+            similarity = F.cosine_similarity(
+                selection_vector.unsqueeze(0), 
+                prototype.unsqueeze(0)
+            )
+
+            if similarity > best_similarity:
+                best_similarity = similarity
+                selected_action = name
+        if selected_action is None:
+          return None, 0
+        return selected_action, best_similarity.item()
 
 class AdaptiveAgent:
     def __init__(self, genetic_core, neural_net, position: Tuple[int, int]):
@@ -68,6 +94,17 @@ class AdaptiveAgent:
         self.name = EmbryoNamer().generate_random_name()
         self.data_augmenter = AdaptiveDataAugmenter()
         self.neural_diagnostics = NeuralDiagnostics(neural_net)
+        self.actions = {
+            "move": self._process_movement,
+            "gather": self._process_gathering,
+            "process": self._process_resources,
+            "share": self._process_sharing,
+            "defend": self._process_defense,
+            "execute_tool": self._process_tool_execution
+        }
+        self.action_decoder = ActionDecoder()
+        for name, method in self.actions.items():
+          self.action_decoder.add_action(name, torch.randn(32), method)
 
     def augment_perception(self, inputs, context = None):
         return self.data_augmenter.augment(inputs, context)
@@ -110,57 +147,89 @@ class AdaptiveAgent:
         ]
         augmented_inputs = self.augment_perception(torch.tensor(inputs + threat_inputs + internal_inputs).float())
 
-        return augmented_inputs
+        return augmented_inputs.numpy()
 
-    def decide_action(self, env_state: EnvironmentalState) -> Tuple[AgentAction, Dict]:
+    def decide_action(self, env_state: EnvironmentalState) -> Tuple[str, Dict]:
+        """Determine next action using neural network and genetic traits"""
+        # Get environmental inputs
         sensor_data = self.perceive_environment(env_state)
 
+        # Genetic Modifiers for Neural Network
         genetic_modifiers = {
             'processing_speed': self.genetic_core.brain_genetics.processing_speed,
             'sensor_sensitivity': self.genetic_core.physical_genetics.sensor_sensitivity
         }
 
+        # Process using neural network, modulated by genetic traits
         network_output, activations = self.neural_net.forward(
-            x=sensor_data.reshape(1, -1),
+            x=torch.tensor(sensor_data).float().reshape(1, -1),
             context=torch.tensor([[0.0]])
         )
-        network_output = network_output.flatten()
-
+       # Decision making influenced by genetic traits
         action_precision = self.genetic_core.physical_genetics.action_precision
         trust_baseline = self.genetic_core.heart_genetics.trust_baseline
+        
+        action_vector = ActionVector(selection=network_output[:, :32], parameters = network_output[:, 32:])
+        # Action selection logic - now based on keys of action dictionary
+        return self._select_action(action_vector, action_precision, trust_baseline, env_state)
 
-        return self._select_action(network_output, action_precision, trust_baseline, env_state) # Pass env_state
+    def _select_action(self, action_vector: ActionVector,
+                      action_precision: float,
+                      trust_baseline: float, env_state: EnvironmentalState) -> Tuple[str, Dict]:
+       # Get action probabilities from network output
+        selection = action_vector.selection
+        temperature = 1.0 / action_precision
+        modified_probs = np.power(selection.detach().numpy(), 1/temperature)
+        modified_probs /= modified_probs.sum()
 
-    def execute_action(self, action: AgentAction, params: Dict) -> ActionResult:
+
+        # Select action based on modified probabilities
+        action_keys = list(self.actions.keys())
+        action_idx = torch.argmax(torch.tensor(modified_probs))
+        selected_action_key = action_keys[action_idx]
+
+        # Generate action parameters based on selected action
+        params = self._generate_action_params(selected_action_key, trust_baseline, env_state)
+
+        return selected_action_key, params
+
+    def execute_action(self, action_key: str, params: Dict, env_state: EnvironmentalState) -> ActionResult:
+        """Execute chosen action with genetic trait influences"""
         energy_efficiency = self.genetic_core.physical_genetics.energy_efficiency
         structural_integrity = self.genetic_core.physical_genetics.structural_integrity
 
-        energy_cost = self._calculate_energy_cost(action) / energy_efficiency
+        # Base energy cost modified by efficiency
+        energy_cost = self._calculate_energy_cost(action_key) / energy_efficiency
 
         if self.energy < energy_cost:
             return ActionResult(False, -1.0, 0.0, None)
 
+        # Action execution logic influenced by genetic traits...
         success_prob = self._calculate_success_probability(
-            action, structural_integrity)
+            action_key, structural_integrity)
 
-        action_result = self._process_action_result(action, params, energy_cost, success_prob, env_state) # Pass env_state
+        # Execute action and return results...
+        action_result = self._process_action_result(action_key, params, energy_cost, success_prob, env_state)
         self.energy -= energy_cost
         return action_result
 
-    def learn_from_experience(self, env_state: EnvironmentalState, action: AgentAction, result: ActionResult):
+    def learn_from_experience(self, env_state: EnvironmentalState, action: str, result: ActionResult):
+        """Update knowledge and adapt based on action outcomes"""
         learning_efficiency = self.genetic_core.mind_genetics.learning_efficiency
         neural_plasticity = self.genetic_core.mind_genetics.neural_plasticity
 
+        # Prepare training data
         sensor_data = self.perceive_environment(env_state)
-        target_output = np.zeros(len(AgentAction))
-        action_index = list(AgentAction).index(action)
+        target_output = np.zeros(len(self.actions))
+        action_index = list(self.actions.keys()).index(action)
         target_output[action_index] = result.reward
         diagnostics = self.neural_diagnostics.monitor_network_health(
-            inputs=torch.tensor(sensor_data).float().reshape(1, -1),
+            inputs=torch.tensor(sensor_data).float().detach().numpy().reshape(1, -1),
             targets=torch.tensor(target_output).float().reshape(1, -1),
             context=torch.tensor([[0.0]]),
             epoch=env_state.time_step
         )
+        # Train Neural Network
         self.neural_net.backward(
             x=sensor_data.reshape(1, -1),
             y=target_output.reshape(1, -1),
@@ -172,9 +241,12 @@ class AdaptiveAgent:
             network_performance = result.reward,
             diagnostics = diagnostics
         )
+        # Update performance metrics
         self._update_metrics(result)
 
     def get_fitness_score(self) -> float:
+        """Calculate comprehensive fitness score including energy management"""
+        # Base fitness from previous metrics
         base_fitness = (
             self.total_resources_gathered * 0.3 +
             self.successful_interactions * 0.2 +
@@ -182,36 +254,24 @@ class AdaptiveAgent:
             self.efficiency_score * 0.2
         )
 
-        energy_ratio = self.energy / 100.0
+        # Energy management component
+        energy_ratio = self.energy / 100.0  # Normalized to starting energy
         energy_stability = 0.1 * energy_ratio
 
         return base_fitness + energy_stability
 
-    def _select_action(self, network_output: np.ndarray,
-        action_precision: float,
-        trust_baseline: float, env_state: EnvironmentalState) -> Tuple[AgentAction, Dict]: # Pass env_state
-        action_probs = network_output
-
-        temperature = 1.0 / action_precision
-        modified_probs = np.power(action_probs, 1/temperature)
-        modified_probs /= modified_probs.sum()
-
-        action_idx = np.random.choice(len(AgentAction), p=modified_probs)
-        selected_action = list(AgentAction)[action_idx]
-
-        params = self._generate_action_params(selected_action, trust_baseline, env_state) # Pass env_state
-
-        return selected_action, params
-
-    def _generate_action_params(self, action: AgentAction, trust_baseline: float, env_state: EnvironmentalState) -> Dict: # Pass env_state
+    def _generate_action_params(self, action: str, trust_baseline: float, env_state: EnvironmentalState) -> Dict:
+        """Generate specific parameters for each action type with genetic influence"""
         params = {}
         genetic_params = self.genetic_core.get_physical_parameters()
         brain_params = self.genetic_core.get_brain_parameters()
 
-        if action == AgentAction.MOVE:
+        if action == "move":
+            # Calculate optimal direction based on resources and threats
             visible_resources = self._get_visible_resources(env_state)
             visible_threats = self._get_visible_threats(env_state)
 
+            # Weight attractors and repulsors based on genetic traits
             direction_vector = np.zeros(2)
 
             for resource in visible_resources:
@@ -222,14 +282,15 @@ class AdaptiveAgent:
             for threat in visible_threats:
                 weight = genetic_params['security_sensitivity']
                 direction = self._calculate_direction_to(threat, env_state)
-                direction_vector -= direction * weight
+                direction_vector -= direction * weight  # Repulsion
 
             params['direction'] = self._normalize_vector(direction_vector)
             params['speed'] = min(2.0, self.energy / 50.0) * genetic_params['energy_efficiency']
 
-        elif action == AgentAction.GATHER:
+        elif action == "gather":
             resources = self._get_visible_resources(env_state)
             if resources:
+                # Score resources based on quantity, distance, and complexity
                 scored_resources = []
                 for resource in resources:
                     distance = self._calculate_distance(resource.position)
@@ -244,77 +305,86 @@ class AdaptiveAgent:
                 best_resource = max(scored_resources, key=lambda x: x[0])[1]
                 params['resource_id'] = best_resource.id
                 params['gather_rate'] = genetic_params['action_precision']
+            else:
+               params['resource_id'] = None
+               params['gather_rate'] = genetic_params['action_precision']
 
-        elif action == AgentAction.PROCESS:
+        elif action == "process":
             params['resource_type'] = self._select_resource_to_process()
             params['processing_efficiency'] = brain_params['processing_speed']
 
-        elif action == AgentAction.SHARE:
+        elif action == "share":
             params['share_amount'] = self.resources[ResourceType.ENERGY] * trust_baseline
             params['target_agent'] = self._select_sharing_target(env_state)
 
-        elif action == AgentAction.DEFEND:
+        elif action == "defend":
             params['defense_strength'] = self.genetic_core.heart_genetics.security_sensitivity
             params['energy_allocation'] = min(self.energy * 0.3, 30.0)
-        elif action == AgentAction.EXECUTE_TOOL:
+        elif action == "execute_tool":
             params['tool_name'] = 'codebase_search'
             params['tool_params'] = {"Query": "self.energy", "TargetDirectories": ['']}
             params['security_level'] = 'LOW'
 
         return params
 
-    def _process_action_result(self, action: AgentAction, params: Dict, energy_cost: float, success_prob: float, env_state: EnvironmentalState) -> ActionResult: # Pass env_state
+    def _process_action_result(self, action: str, params: Dict, energy_cost: float, success_prob: float, env_state: EnvironmentalState) -> ActionResult:
+        """Placeholder: Process gathering action and return reward"""
         success = False
         reward = 0.0
         new_state = {}
 
+        # Assume action succeeds based on probability
         if random.random() < success_prob:
             success = True
 
-        if action == AgentAction.GATHER:
+        if action == "gather":
             reward = self._process_gathering(params, success, env_state)
-        elif action == AgentAction.PROCESS:
+        elif action == "process":
             reward = self._process_resources(params, success)
-        elif action == AgentAction.SHARE:
+        elif action == "share":
             reward = self._process_sharing(params, success)
-        elif action == AgentAction.DEFEND:
+        elif action == "defend":
             reward = self._process_defense(params, success)
-        elif action == AgentAction.MOVE:
+        elif action == "move":
             reward = self._process_movement(params, success)
-        elif action == AgentAction.EXECUTE_TOOL:
+        elif action == "execute_tool":
             reward = self._process_tool_execution(params, success)
 
+        # Update efficiency score based on reward/energy cost ratio
         if energy_cost > 0:
-            self.efficiency_score = (self.efficiency_score + max(0, reward)/energy_cost) / 2
+           self.efficiency_score = (self.efficiency_score + max(0, reward)/energy_cost) / 2
 
         return ActionResult(success, reward, energy_cost, new_state)
 
-    def _calculate_energy_cost(self, action: AgentAction) -> float:
+    def _calculate_energy_cost(self, action: str) -> float:
+        """Base energy cost for actions - can be adjusted based on action and genetics"""
         base_costs = {
-            AgentAction.MOVE: 1.0,
-            AgentAction.GATHER: 2.0,
-            AgentAction.PROCESS: 5.0,
-            AgentAction.SHARE: 1.5,
-            AgentAction.DEFEND: 3.0,
-            AgentAction.EXECUTE_TOOL: 7.0
+            "move": 1.0,
+            "gather": 2.0,
+            "process": 5.0,
+            "share": 1.5,
+            "defend": 3.0,
+            "execute_tool": 7.0
         }
         return base_costs.get(action, 1.0)
 
-    def _calculate_success_probability(self, action: AgentAction, structural_integrity: float) -> float:
+    def _calculate_success_probability(self, action: str, structural_integrity: float) -> float:
+        """Probability of action success influenced by structural integrity"""
         base_probabilities = {
-            AgentAction.MOVE: 0.95,
-            AgentAction.GATHER: 0.8,
-            AgentAction.PROCESS: 0.7,
-            AgentAction.SHARE: 0.99,
-            AgentAction.DEFEND: 0.6,
-            AgentAction.EXECUTE_TOOL: 0.9
+            "move": 0.95,
+            "gather": 0.8,
+            "process": 0.7,
+            "share": 0.99,
+            "defend": 0.6,
+            "execute_tool": 0.9
         }
         return base_probabilities.get(action, 0.8) * structural_integrity
 
     def _update_metrics(self, result: ActionResult):
+        """Update agent performance metrics based on action result"""
         if result.success:
             self.successful_interactions += 1
-            self.total_resources_gathered += max(0, result.reward)
+            self.total_resources_gathered += max(0, result.reward) # Only count positive resource rewards
         self.survival_time += 1
 
     def _calculate_distance(self, target_pos: Tuple[int, int]) -> float:
@@ -380,159 +450,6 @@ class AdaptiveAgent:
         if nearby_agents:
             return random.choice(nearby_agents)
         return None
-
-    def _process_gathering(self, params: Dict, success: bool, env_state: EnvironmentalState) -> float:
-        if success and params['resource_id']:
-            resource_id = params['resource_id']
-            for resource in env_state.resources:
-                if resource.id == resource_id:
-                    gathered_quantity = min(resource.quantity, params['gather_rate'])
-                    self.resources[resource.type] += gathered_quantity
-                    resource.quantity -= gathered_quantity
-                    return gathered_quantity
-        return -0.1
-
-    def _process_resources(self, params: Dict, success: bool) -> float:
-        if success and params['resource_type']:
-            resource_type = params['resource_type']
-            if self.resources[resource_type] > 0:
-                processing_rate = params['processing_efficiency']
-                processed_quantity = self.resources[resource_type] * processing_rate
-                self.resources[resource_type] -= processed_quantity
-                self.energy += processed_quantity * 10
-                return processed_quantity * 5
-        return -0.5
-
-    def _process_sharing(self, params: Dict, success: bool) -> float:
-        if success and params['target_agent']:
-            share_amount = params['share_amount']
-            target_agent = params['target_agent']
-            if self.resources[ResourceType.ENERGY] >= share_amount:
-                self.resources[ResourceType.ENERGY] -= share_amount
-                target_agent.energy += share_amount
-                return share_amount
-        return -0.2
-
-    def _process_defense(self, params: Dict, success: bool) -> float:
-        if success:
-            defense_strength = params['defense_strength']
-            energy_invested = params['energy_allocation']
-            self.energy -= energy_invested
-            return defense_strength
-        return -0.3
-
-    def _process_movement(self, params: Dict, success: bool) -> float:
-        if success:
-            direction = params['direction']
-            speed = params['speed']
-            new_position = (self.position[0] + direction[0] * speed, self.position[1] + direction[1] * speed)
-            self.position = new_position
-            return 0.01
-        return -0.05
-
-    def _process_tool_execution(self, params: Dict, success: bool) -> float:
-        if success and params['tool_name']:
-            tool_name = params['tool_name']
-            if tool_name == 'codebase_search':
-                return 1.0
-        return -0.8
-
-class EnhancedAdaptiveEnvironment(AdaptiveEnvironment):
-    def __init__(self, size: Tuple[int, int], complexity: float):
-        super().__init__(size, complexity) # ADDED super().__init__(size, complexity)
-        self.terrain = self._generate_terrain()
-        self.weather = self._initialize_weather()
-        self.agents = []
-
-    def _generate_terrain(self) -> np.ndarray:
-        size_x, size_y = self.size
-        terrain = np.zeros(self.size)
-        scale = 10
-        octaves = 6
-        persistence = 0.5
-        lacunarity = 2.0
-
-        for i in range(octaves):
-            frequency = lacunarity ** i
-            amplitude = persistence ** i
-            x_coords = np.linspace(0, size_x / scale * frequency, size_x)
-            y_coords = np.linspace(0, size_y / scale * frequency, size_y)
-            xv, yv = np.meshgrid(x_coords, y_coords)
-            noise = PerlinNoise(octaves=octaves) 
-            sample = np.array([[noise([x, y]) for x in x_coords] for y in y_coords])
-            terrain += amplitude * sample
-
-        terrain = (terrain - terrain.min()) / (terrain.max() - terrain.min())
-        return terrain
-
-    def _update_state(self):
-        self.current_state.time_step += 1
-
-        for resource in self.current_state.resources:
-            if resource.quantity < 100:
-                resource.quantity += random.uniform(0, 0.5)
-            resource.position = (
-                max(0, min(self.size[0] - 1, int(resource.position[0] + random.uniform(-1, 1)))),
-                max(0, min(self.size[1] - 1, int(resource.position[1] + random.uniform(-1, 1))))
-            )
-
-        for i in range(len(self.current_state.threats)):
-            threat_pos = self.current_state.threats[i]
-            nearest_agent = self._find_nearest_agent(threat_pos)
-            if nearest_agent:
-                direction = self._calculate_direction_to(threat_pos, nearest_agent.position)
-                new_threat_pos = (threat_pos[0] + direction[0], threat_pos[1] + direction[1])
-                self.current_state.threats[i] = (max(0, min(self.size[0]-1, int(new_threat_pos[0]))), max(0, min(self.size[1]-1, int(new_threat_pos[1]))))
-            else:
-                self.current_state.threats[i] = (max(0, min(self.size[0]-1, int(threat_pos[0] + random.uniform(-1, 1)))), max(0, min(self.size[1]-1, int(threat_pos[1] + random.uniform(-1, 1)))))
-
-
-        if random.random() < 0.01 * self.current_state.complexity_level:
-            self.current_state.resources.append(
-                Resource(
-                    type=ResourceType.ENERGY,
-                    quantity=random.uniform(10, 50),
-                    position=(random.randint(0, self.size[0]-1), random.randint(0, self.size[1]-1)),
-                    complexity=random.uniform(0.1, 0.9)
-                )
-            )
-        self.current_state.agents = self.agents
-
-
-    def _calculate_threat_movement(self, threat_pos: Tuple[float, float]) -> Tuple[float, float]:
-        return (random.uniform(-1, 1), random.uniform(-1, 1))
-
-    def _find_nearest_agent(self, pos: Tuple[float, float]) -> Optional['AdaptiveAgent']:
-        min_distance = float('inf')
-        nearest_agent = None
-        for agent in self.agents:
-            distance = self._calculate_distance(pos, agent.position)
-            if distance < min_distance:
-                min_distance = distance
-                nearest_agent = agent
-        return nearest_agent
-
-    def _calculate_distance(self, pos1: Tuple[float, float], pos2: Tuple[float, float]) -> float:
-        return math.sqrt((pos1[0] - pos2[0])**2 + (pos1[1] - pos2[1])**2)
-
-
-    def _generate_perlin_noise(self, size: Tuple[int, int], scale: float) -> np.ndarray:
-        return np.zeros(size)
-
-    def _initialize_weather(self) -> Dict:
-        return {}
-
-    def _update_weather(self, current_weather: Dict) -> Dict:
-        return current_weather
-
-    def _get_terrain_factor(self, position: Tuple[int, int]) -> float:
-        return 1.0
-
-    def _get_weather_factor(self, position: Tuple[int, int]) -> float:
-        return 1.0
-
-    def _calculate_terrain_gradient(self, position: Tuple[int, int]) -> Tuple[float, float]:
-        return (0.0, 0.0)
-
-    def _find_nearest_agent(self, pos: Tuple[float, float]) -> Optional['AdaptiveAgent']:
-        return None
+    
+    def learn_action(self, action_name: str, action_function):
+      self.actions[action_name] = action_function
